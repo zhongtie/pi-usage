@@ -1,0 +1,101 @@
+{
+  "schemaVersion": 1,
+  "id": "zjm.pi-usage",
+  "name": "Pi Usage",
+  "version": "1.0.0",
+  "author": "zjm",
+  "license": "MIT",
+  "description": "Token burn and dollars spent by pi, read from pi's own session transcripts: a live heat strip in the bar and a click-through report.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Pi Usage",
+    "description": "Pi token spend as a heat strip: today's tokens and cost in the bar, burn window, hourly history, models, projects and sessions in the popup.",
+    "category": "AI",
+    "aliases": [
+      "pi",
+      "deepseek",
+      "tokens",
+      "usage",
+      "spend",
+      "cost",
+      "llm"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "center",
+    "defaults": {
+      "windowMinutes": 360,
+      "cells": 12,
+      "refreshIntervalSec": 10,
+      "labelPeriod": "today",
+      "showCells": true,
+      "showCost": true,
+      "followTheme": true
+    },
+    "schema": [
+      {
+        "key": "windowMinutes",
+        "type": "integer",
+        "label": "History window (minutes)",
+        "description": "How far back the heat strip reaches. 360 = six hours.",
+        "min": 30,
+        "max": 1440,
+        "defaultValue": 360
+      },
+      {
+        "key": "cells",
+        "type": "integer",
+        "label": "Cells in the strip",
+        "min": 4,
+        "max": 48,
+        "defaultValue": 12
+      },
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 5,
+        "max": 600,
+        "defaultValue": 10
+      },
+      {
+        "key": "labelPeriod",
+        "type": "enum",
+        "label": "Bar label period",
+        "options": [
+          "today",
+          "d7",
+          "d30",
+          "all"
+        ],
+        "defaultValue": "today",
+        "description": "Which totals the bar label shows. Right click walks the same ring."
+      },
+      {
+        "key": "showCells",
+        "type": "boolean",
+        "label": "Show the heat strip",
+        "defaultValue": true
+      },
+      {
+        "key": "showCost",
+        "type": "boolean",
+        "label": "Show cost beside tokens",
+        "defaultValue": true
+      },
+      {
+        "key": "followTheme",
+        "type": "boolean",
+        "label": "Follow theme colours",
+        "description": "Off pins the strip to DeepSeek blue on every theme.",
+        "defaultValue": true
+      }
+    ]
+  },
+  "repository": "https://github.com/zhongtie/pi-usage",
+  "homepage": ""
+}

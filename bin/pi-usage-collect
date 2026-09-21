@@ -1,0 +1,453 @@
+#!/usr/bin/env python3
+"""pi-usage-collect: bucket pi's own session transcripts into tokens and money.
+
+Source:  ~/.pi/agent/sessions/<project>/<stamp>_<uuid>.jsonl
+         Every `message` entry whose message.role is "assistant" and whose
+         message.usage is present carries input / cacheWrite / output /
+         cacheRead token counts, a cost block and a model id. The entry's own
+         timestamp is the only clock, exactly how Burn Bar reads the agent
+         transcripts it supports.
+
+Writes one small JSON the QML widget watches:
+    $XDG_STATE_HOME/omarchy/pi-usage/report.json
+
+An unchanged file (same mtime and size) is not re-parsed: its points come back
+out of scan-cache.json. A partial last line from a session still being written
+fails json.loads and is skipped, which is why a live session never breaks the
+collector.
+
+usage: pi-usage-collect [--window MIN] [--buckets N] [--hours N] [--print]
+
+  --window MIN   minutes the bar strip reaches back (30..1440, default 360)
+  --buckets N    cells the bar strip draws (4..96, default 12)
+  --hours N      hourly buckets in the report (6..72, default 24)
+  --print        also print the report to stdout, indented
+
+environment: PI_USAGE_SESSIONS, PI_USAGE_STATE_DIR, PI_USAGE_NOW_MS
+"""
+
+import argparse
+import json
+import os
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+HOME = Path(os.path.expanduser("~"))
+CACHE_VERSION = 1
+
+
+def env_path(name):
+    value = os.environ.get(name)
+    if not value:
+        return None
+    return Path(os.path.expanduser(value))
+
+
+SESSIONS_ROOT = env_path("PI_USAGE_SESSIONS") or HOME / ".pi" / "agent" / "sessions"
+INDEX_PATH = HOME / ".pi" / "agent" / "pi-web-session-index.json"
+STATE_DIR = env_path("PI_USAGE_STATE_DIR") or Path(
+    os.environ.get("XDG_STATE_HOME") or HOME / ".local" / "state"
+) / "omarchy" / "pi-usage"
+REPORT_PATH = STATE_DIR / "report.json"
+CACHE_PATH = STATE_DIR / "scan-cache.json"
+
+HOUR_MS = 3600 * 1000
+DAY_MS = 24 * HOUR_MS
+
+
+# ── parsing helpers ──────────────────────────────────────────────────────────
+
+
+def parse_ts(value):
+    """ISO-8601 (with or without Z) to epoch ms, or None when unreadable."""
+    if not value:
+        return None
+    try:
+        text = str(value).strip().replace("Z", "+00:00")
+        parsed = datetime.fromisoformat(text)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return int(parsed.timestamp() * 1000)
+    except (ValueError, OSError, OverflowError):
+        return None
+
+
+def count(value):
+    """A sane non-negative token count, or None when the field is unusable."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if value != value or value < 0 or value > 1e15:  # NaN, negative, absurd
+        return None
+    return int(value)
+
+
+def money(value):
+    """A sane non-negative cost, or None."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if value != value or value < 0 or value > 1e12:
+        return None
+    return float(value)
+
+
+def short_home(path):
+    text = str(path or "").rstrip("/")
+    if not text:
+        return ""
+    home = str(HOME)
+    if text == home:
+        return "~"
+    if text.startswith(home + "/"):
+        return "~" + text[len(home):]
+    return text
+
+
+def project_from_dir(path):
+    """`--home-zjm-Projects-cyber_support--` -> `/home/zjm/Projects/cyber_support`.
+
+    The slug is lossy (a real dash and a path separator look the same), so it
+    is only a fallback for a transcript whose own session line carried no cwd.
+    """
+    name = path.parent.name
+    if name.startswith("--"):
+        name = name[2:]
+    if name.endswith("--"):
+        name = name[:-2]
+    if not name:
+        return ""
+    return "/" + name.replace("--", "/").replace("-", "/")
+
+
+def scan_file(path):
+    """(points, session) for one transcript. Never raises on bad input."""
+    points = []
+    session = {"id": "", "cwd": "", "startedAt": 0}
+    try:
+        handle = open(path, "r", encoding="utf-8", errors="replace")
+    except OSError:
+        return points, session
+    with handle:
+        for line in handle:
+            line = line.strip()
+            if not line or not line.startswith("{"):
+                continue
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                continue  # a partial last line: the session is still writing
+            if not isinstance(entry, dict):
+                continue
+            kind = entry.get("type")
+            if kind == "session":
+                session = {
+                    "id": str(entry.get("id") or ""),
+                    "cwd": str(entry.get("cwd") or ""),
+                    "startedAt": parse_ts(entry.get("timestamp")) or 0,
+                }
+                continue
+            if kind != "message":
+                continue
+            message = entry.get("message")
+            if not isinstance(message, dict) or message.get("role") != "assistant":
+                continue
+            usage = message.get("usage")
+            if not isinstance(usage, dict):
+                continue
+            ts = parse_ts(entry.get("timestamp"))
+            if ts is None:
+                continue
+            fresh = count(usage.get("input"))
+            cache_write = count(usage.get("cacheWrite"))
+            output = count(usage.get("output"))
+            cache_read = count(usage.get("cacheRead"))
+            if None in (fresh, cache_write, output, cache_read):
+                continue
+            # Billable burn is fresh input + cache writes + output. Cache reads
+            # are billed too, but at a fraction of the rate and an order of
+            # magnitude more tokens, so they would swamp the heat scale; they
+            # are carried separately for the panel's cache line.
+            tokens = fresh + cache_write + output
+            if tokens <= 0 and cache_read <= 0:
+                continue
+            cost = 0.0
+            cost_block = usage.get("cost")
+            if isinstance(cost_block, dict):
+                cost = money(cost_block.get("total")) or 0.0
+            points.append([ts, tokens, round(cost, 6), str(message.get("model") or "unknown"), cache_read])
+    points.sort(key=lambda point: point[0])
+    return points, session
+
+
+# ── scan cache ───────────────────────────────────────────────────────────────
+
+
+def load_cache():
+    try:
+        with open(CACHE_PATH, "r", encoding="utf-8") as handle:
+            cached = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(cached, dict) or cached.get("v") != CACHE_VERSION:
+        return {}
+    files = cached.get("files")
+    return files if isinstance(files, dict) else {}
+
+
+def load_session_names():
+    """path -> pi-web session name, when pi-web has indexed the session."""
+    try:
+        with open(INDEX_PATH, "r", encoding="utf-8") as handle:
+            index = json.load(handle)
+        entries = index.get("entries")
+    except (OSError, ValueError, AttributeError):
+        return {}
+    names = {}
+    if isinstance(entries, dict):
+        for entry in entries.values():
+            info = entry.get("info") if isinstance(entry, dict) else None
+            if isinstance(info, dict) and info.get("path"):
+                names[str(info["path"])] = str(info.get("name") or "")
+    return names
+
+
+def walk_transcripts(root):
+    if not root.is_dir():
+        return []
+    return sorted(p for p in root.rglob("*.jsonl") if p.is_file())
+
+
+# ── aggregation ──────────────────────────────────────────────────────────────
+
+
+def blank_range():
+    return {"tokens": 0, "cacheRead": 0, "cost": 0.0, "turns": 0, "sessions": 0}
+
+
+def add_to(target, tokens, cache_read, cost):
+    target["tokens"] += tokens
+    target["cacheRead"] += cache_read
+    target["cost"] += cost
+    target["turns"] += 1
+
+
+def build_report(args, now):
+    cached = load_cache()
+    names = load_session_names()
+    documents = []
+
+    for path in walk_transcripts(SESSIONS_ROOT):
+        key = str(path)
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        stamp = {"mtime": stat.st_mtime, "size": stat.st_size}
+        held = cached.get(key)
+        if isinstance(held, dict) and held.get("mtime") == stamp["mtime"] and held.get("size") == stamp["size"]:
+            points = held.get("points") or []
+            session = held.get("session") or {}
+        else:
+            points, session = scan_file(path)
+        if not session.get("cwd"):
+            session = dict(session)
+            session["cwd"] = project_from_dir(path)
+        documents.append(
+            {
+                "path": key,
+                "points": points,
+                "session": session,
+                "cache": {"mtime": stamp["mtime"], "size": stamp["size"]},
+            }
+        )
+
+    # Buckets across the strip's window, oldest first.
+    window_ms = args.window * 60 * 1000
+    bucket_ms = window_ms / float(args.buckets)
+    window_start = now - window_ms
+    buckets = [
+        {"t": int(window_start + i * bucket_ms), "tokens": 0, "cacheRead": 0, "cost": 0.0}
+        for i in range(args.buckets)
+    ]
+
+    hours = [
+        {"t": int(now - (args.hours - i) * HOUR_MS), "tokens": 0, "cacheRead": 0, "cost": 0.0}
+        for i in range(args.hours)
+    ]
+    hours_start = now - args.hours * HOUR_MS
+
+    local_now = datetime.fromtimestamp(now / 1000.0)
+    midnight = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+    today_start = int(midnight.timestamp() * 1000)
+    ranges = {
+        "today": today_start,
+        "d7": now - 7 * DAY_MS,
+        "d30": now - 30 * DAY_MS,
+        "all": 0,
+    }
+    totals = {name: blank_range() for name in ranges}
+    by_model = {}
+    projects = {}
+    sessions = []
+    first_at = 0
+    last_at = 0
+    last_model = ""
+    turns = 0
+
+    for document in documents:
+        session = document["session"]
+        session_totals = blank_range()
+        # A session counts once in a range it burned in, however many turns it
+        # put there: the number is there to say "five sessions today", not to
+        # repeat the turn count in another unit.
+        touched = {name: False for name in ranges}
+        for ts, tokens, cost, model, cache_read in document["points"]:
+            turns += 1
+            session_totals["tokens"] += tokens
+            session_totals["cacheRead"] += cache_read
+            session_totals["cost"] += cost
+            session_totals["turns"] += 1
+            if first_at == 0 or ts < first_at:
+                first_at = ts
+            if ts > last_at:
+                last_at = ts
+                last_model = model
+
+            for name, start in ranges.items():
+                if ts >= start:
+                    add_to(totals[name], tokens, cache_read, cost)
+                    touched[name] = True
+
+            if ts >= window_start:
+                index = int((ts - window_start) / bucket_ms)
+                index = 0 if index < 0 else (args.buckets - 1 if index >= args.buckets else index)
+                bucket = buckets[index]
+                bucket["tokens"] += tokens
+                bucket["cacheRead"] += cache_read
+                bucket["cost"] += cost
+
+            if ts >= hours_start:
+                index = int((ts - hours_start) / HOUR_MS)
+                index = 0 if index < 0 else (args.hours - 1 if index >= args.hours else index)
+                hour = hours[index]
+                hour["tokens"] += tokens
+                hour["cacheRead"] += cache_read
+                hour["cost"] += cost
+
+            if ts >= ranges["d7"]:
+                row = by_model.setdefault(model, {"model": model, "tokens": 0, "cacheRead": 0, "cost": 0.0, "turns": 0})
+                row["tokens"] += tokens
+                row["cacheRead"] += cache_read
+                row["cost"] += cost
+                row["turns"] += 1
+                slug = short_home(session.get("cwd") or "unknown")
+                project = projects.setdefault(slug, {"name": slug, "tokens": 0, "cost": 0.0, "turns": 0})
+                project["tokens"] += tokens
+                project["cost"] += cost
+                project["turns"] += 1
+
+        for name in ranges:
+            if touched[name]:
+                totals[name]["sessions"] += 1
+
+        if session_totals["turns"] > 0:
+            sessions.append(
+                {
+                    "id": session.get("id") or "",
+                    "name": names.get(document["path"], ""),
+                    "cwd": short_home(session.get("cwd") or ""),
+                    "startedAt": session.get("startedAt") or 0,
+                    "lastAt": document["points"][-1][0],
+                    "tokens": session_totals["tokens"],
+                    "cacheRead": session_totals["cacheRead"],
+                    "cost": round(session_totals["cost"], 6),
+                    "turns": session_totals["turns"],
+                }
+            )
+
+    for name, bucket in totals.items():
+        bucket["cost"] = round(bucket["cost"], 6)
+
+    sessions.sort(key=lambda row: row["lastAt"], reverse=True)
+    model_rows = sorted(by_model.values(), key=lambda row: row["tokens"], reverse=True)
+    for row in model_rows:
+        row["cost"] = round(row["cost"], 6)
+    project_rows = sorted(projects.values(), key=lambda row: row["tokens"], reverse=True)
+    for row in project_rows:
+        row["cost"] = round(row["cost"], 6)
+
+    report = {
+        "generatedAt": now,
+        "windowMinutes": args.window,
+        "bucketMinutes": round(bucket_ms / 60000.0, 4),
+        "bucketCount": args.buckets,
+        "buckets": buckets,
+        "hourly": hours,
+        "totals": totals,
+        "byModel": model_rows[:8],
+        "projects": project_rows[:8],
+        "sessions": sessions[:6],
+        "sessionsFound": len(documents),
+        "turns": turns,
+        "firstAt": first_at,
+        "lastAt": last_at,
+        "lastModel": last_model,
+        "source": str(SESSIONS_ROOT),
+    }
+
+    cache_out = {
+        "v": CACHE_VERSION,
+        "files": {
+            document["path"]: {
+                "mtime": document["cache"]["mtime"],
+                "size": document["cache"]["size"],
+                "session": document["session"],
+                "points": document["points"],
+            }
+            for document in documents
+        },
+    }
+    return report, cache_out
+
+
+def main(argv):
+    parser = argparse.ArgumentParser(add_help=True, description="Aggregate pi session usage into one JSON report.")
+    parser.add_argument("--window", type=int, default=360)
+    parser.add_argument("--buckets", type=int, default=12)
+    parser.add_argument("--hours", type=int, default=24)
+    parser.add_argument("--print", dest="echo", action="store_true")
+    args = parser.parse_args(argv)
+
+    args.window = max(30, min(1440, args.window))
+    args.buckets = max(4, min(96, args.buckets))
+    args.hours = max(6, min(72, args.hours))
+
+    try:
+        now = int(os.environ.get("PI_USAGE_NOW_MS") or time.time() * 1000)
+    except ValueError:
+        now = int(time.time() * 1000)
+
+    report, cache = build_report(args, now)
+
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        temp = REPORT_PATH.with_suffix(".json.tmp")
+        with open(temp, "w", encoding="utf-8") as handle:
+            json.dump(report, handle, separators=(",", ":"))
+        os.replace(temp, REPORT_PATH)
+        temp = CACHE_PATH.with_suffix(".json.tmp")
+        with open(temp, "w", encoding="utf-8") as handle:
+            json.dump(cache, handle, separators=(",", ":"))
+        os.replace(temp, CACHE_PATH)
+    except OSError as error:
+        print("pi-usage-collect: cannot write %s: %s" % (STATE_DIR, error), file=sys.stderr)
+        return 1
+
+    if args.echo:
+        print(json.dumps(report, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
