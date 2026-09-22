@@ -22,7 +22,10 @@ works on networks that block github.com's HTTPS):
 
 ```sh
 omarchy plugin add https://github.com/zhongtie/pi-usage.git --enable --yes
-或者
+omarchy plugin update zjm.pi-usage        # later, to pull a new version
+```
+or
+```sh
 omarchy plugin add git@github.com:zhongtie/pi-usage.git --enable --yes
 omarchy plugin update zjm.pi-usage        # later, to pull a new version
 ```
